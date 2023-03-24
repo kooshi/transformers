@@ -31,6 +31,7 @@ from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast,
 from ...modeling_utils import PreTrainedModel
 from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from .configuration_llama import LlamaConfig
+from torch.distributed.pipeline.sync import Pipe, NoChunk
 
 
 logger = logging.get_logger(__name__)
@@ -332,6 +333,38 @@ class LlamaDecoderLayer(nn.Module):
         return outputs
 
 
+class LlamaPipeDecoderLayer(nn.Module):
+    def __init__(self, decoder_layer: LlamaDecoderLayer):
+        super().__init__()
+        self.decoder_layer = decoder_layer
+    
+    def forward(self, idx, hidden_states, attention_mask, past_key_values, all_hidden_states, all_self_attns, next_decoder_cache, gradient_checkpointing, training):
+        if all_hidden_states is not None:
+            all_hidden_states += (hidden_states,)
+        output_attentions = all_self_attns is not None
+        use_cache = next_decoder_cache is not None
+
+        past_key_value = past_key_values[idx] if past_key_values is not None else None
+        
+        layer_outputs = self.decoder_layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+
+        hidden_states = layer_outputs[0]
+
+        if use_cache:
+            next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+
+        if output_attentions:
+            all_self_attns += (layer_outputs[1],)
+
+        return (idx + 1, hidden_states, attention_mask, past_key_values, all_hidden_states, all_self_attns, next_decoder_cache, gradient_checkpointing, training)
+            
+
 LLAMA_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
@@ -488,6 +521,9 @@ class LlamaModel(LlamaPreTrainedModel):
 
         return combined_attention_mask
 
+    def prepare_for_pipeline(self, chunks: int):
+        self.layers = Pipe(nn.Sequential(*[LlamaPipeDecoderLayer(l) for l in self.layers]), chunks=chunks)
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -589,43 +625,12 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        for idx, decoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        #TODO make hidden_states a microbatch tensor where first dimension is batch size
+        # refer to https://pytorch.org/docs/stable/pipeline.html#torch.distributed.pipeline.sync.Pipe.forward
+        outputs = self.layers(0, hidden_states, NoChunk(attention_mask), past_key_values, all_hidden_states, all_self_attns, next_decoder_cache, self.gradient_checkpointing, self.training)
+        (_layercount, hidden_states, attention_mask, past_key_values, all_hidden_states, all_self_attns, next_decoder_cache, _, _) = outputs.local_value()
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
 
-            if self.gradient_checkpointing and self.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs, output_attentions, None)
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(decoder_layer),
-                    hidden_states,
-                    attention_mask,
-                    None,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
-
-            hidden_states = layer_outputs[0]
-
-            if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -788,6 +793,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            print(f"##########################\nLOSS: {loss}")
 
         if not return_dict:
             output = (logits,) + outputs[1:]
